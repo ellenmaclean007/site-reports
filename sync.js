@@ -84,12 +84,14 @@
   // Synchronous on purpose: the app reads localStorage the moment it mounts,
   // so the data has to already be sitting there.
   var serverHadNothing = true;
+  var loadedAtStartup = [];   // exactly what the server held when we opened
   try {
     var xhr = new XMLHttpRequest();
     xhr.open('GET', '/api/reports', false);
     xhr.send(null);
     if (xhr.status === 200) {
       var list = JSON.parse(xhr.responseText || '[]');
+      loadedAtStartup = list;
       var assembled = assemble(list);
       if (assembled) {
         cacheLocally(JSON.stringify(assembled));
@@ -138,11 +140,109 @@
     return Promise.all(jobs).then(function () { return reports; });
   }
 
+  /* ---------- 2b. Three-way merge ----------
+     The author edits a report's content; other departments tick items
+     complete on that same report. Both are writing to the same record, so a
+     plain overwrite loses one side. We resolve it by comparing three
+     versions of every field:
+
+       base   - what the server held when THIS device opened the page
+       ours   - what this device has now
+       theirs - what the server holds at the moment we save
+
+     If we didn't touch a field, take theirs. If we did, keep ours. Sign-offs
+     (doneMap) are unioned, never overwritten, so a tick is never lost.
+  --------------------------------------------------------------------- */
+  function byId(arr) {
+    var m = {};
+    (arr || []).forEach(function (x) { if (x && x.id) m[x.id] = x; });
+    return m;
+  }
+  function same(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
+
+  function mergeFields(base, ours, theirs, skip) {
+    var out = {};
+    var keys = {};
+    Object.keys(theirs || {}).forEach(function (k) { keys[k] = 1; });
+    Object.keys(ours || {}).forEach(function (k) { keys[k] = 1; });
+    Object.keys(keys).forEach(function (k) {
+      if (skip && skip.indexOf(k) !== -1) return;
+      var b = base ? base[k] : undefined;
+      // untouched by us -> accept whatever the server has
+      out[k] = same(ours ? ours[k] : undefined, b) ? (theirs || {})[k] : (ours || {})[k];
+    });
+    return out;
+  }
+
+  function mergeIssue(base, ours, theirs) {
+    if (!ours) return theirs;
+    if (!theirs) return ours;
+    var out = mergeFields(base, ours, theirs, ['doneMap']);
+    // union of sign-offs: if either side marked a department done, it's done
+    var dm = {};
+    Object.keys((theirs.doneMap) || {}).forEach(function (d) { dm[d] = theirs.doneMap[d]; });
+    Object.keys((ours.doneMap) || {}).forEach(function (d) { dm[d] = ours.doneMap[d]; });
+    out.doneMap = dm;
+    return out;
+  }
+
+  function mergeLot(base, ours, theirs) {
+    if (!ours) return theirs;
+    if (!theirs) return ours;
+    var out = mergeFields(base, ours, theirs, ['issues']);
+    var bI = byId(base && base.issues), oI = byId(ours.issues), tI = byId(theirs.issues);
+    var order = (ours.issues || []).map(function (i) { return i.id; });
+    (theirs.issues || []).forEach(function (i) {
+      if (order.indexOf(i.id) === -1 && !bI[i.id]) order.push(i.id); // added by them
+    });
+    out.issues = order.map(function (id) {
+      return mergeIssue(bI[id], oI[id], tI[id]);
+    }).filter(Boolean);
+    return out;
+  }
+
+  function mergeReport(base, ours, theirs) {
+    if (!theirs || !base) return ours;
+    if (same(fingerprint(theirs), fingerprint(base))) return ours; // nobody else changed it
+    var out = mergeFields(base, ours, theirs, ['lots']);
+    var bL = byId(base.lots), oL = byId(ours.lots), tL = byId(theirs.lots);
+    var order = (ours.lots || []).map(function (l) { return l.id; });
+    (theirs.lots || []).forEach(function (l) {
+      if (order.indexOf(l.id) === -1 && !bL[l.id]) order.push(l.id);
+    });
+    out.lots = order.map(function (id) {
+      return mergeLot(bL[id], oL[id], tL[id]);
+    }).filter(Boolean);
+    return out;
+  }
+
+  function baselineFor(id) {
+    for (var i = 0; i < loadedAtStartup.length; i++) {
+      if (loadedAtStartup[i] && loadedAtStartup[i].id === id) return loadedAtStartup[i];
+    }
+    return null;
+  }
+
   /* ---------- 3. Intercept saves ---------- */
   var timer = null;
   var latest = null;
   var inFlight = false;
-  var lastSent = {}; // id -> JSON string, so we only PUT what actually changed
+  // id -> JSON string, so we only PUT reports this device actually changed.
+  // Seeded with what the server held at page load: without this, the first
+  // save would push back every report we merely READ, silently reverting
+  // anyone else's edits made since we opened the page.
+  // Content fingerprint, ignoring updatedAt - otherwise the timestamp we stamp
+  // on every push would make each report look changed forever.
+  function fingerprint(r) {
+    var copy = {};
+    Object.keys(r).forEach(function (k) { if (k !== 'updatedAt') copy[k] = r[k]; });
+    return JSON.stringify(copy);
+  }
+
+  var lastSent = {};
+  loadedAtStartup.forEach(function (r) {
+    if (r && r.id) lastSent[r.id] = fingerprint(r);
+  });
 
   function pushToServer() {
     if (inFlight || latest === null) return;
@@ -165,19 +265,36 @@
         if (rebuilt) cacheLocally(JSON.stringify(rebuilt));
 
         var changed = clean.filter(function (r) {
-          var s = JSON.stringify(r);
+          var s = fingerprint(r);
           if (lastSent[r.id] === s) return false;
           lastSent[r.id] = s;
           return true;
         });
 
         return Promise.all(changed.map(function (r) {
-          r.updatedAt = Date.now();
-          return fetch('/api/reports', {
-            method: 'PUT',
-            headers: editHeaders({ 'Content-Type': 'application/json' }),
-            body: JSON.stringify(r)
-          });
+          // Re-read this report immediately before writing, so anything a
+          // colleague changed while we had the page open gets merged in
+          // rather than flattened.
+          return fetch('/api/reports?t=' + Date.now(), { cache: 'no-store' })
+            .then(function (res) { return res.ok ? res.json() : []; })
+            .then(function (serverList) {
+              var theirs = null;
+              (serverList || []).forEach(function (x) { if (x && x.id === r.id) theirs = x; });
+              var merged = mergeReport(baselineFor(r.id), r, theirs);
+              merged.updatedAt = Date.now();
+              // this merged state becomes our new baseline
+              lastSent[r.id] = fingerprint(merged);
+              for (var i = 0; i < loadedAtStartup.length; i++) {
+                if (loadedAtStartup[i] && loadedAtStartup[i].id === r.id) {
+                  loadedAtStartup[i] = JSON.parse(JSON.stringify(merged));
+                }
+              }
+              return fetch('/api/reports', {
+                method: 'PUT',
+                headers: editHeaders({ 'Content-Type': 'application/json' }),
+                body: JSON.stringify(merged)
+              });
+            });
         }));
       })
       .then(function (results) {
