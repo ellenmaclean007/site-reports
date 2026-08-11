@@ -258,6 +258,11 @@
     var reports = [toReport(state)].concat(state.history || []);
     reports = reports.filter(function (r) { return r && r.id; });
 
+    // Only finalized reports go to the shared server. A report you are still
+    // writing stays on your own device until you press FINALIZE REPORT, so
+    // nobody sees half-finished work and New Report never creates a blank.
+    reports = reports.filter(function (r) { return r.published === true; });
+
     offloadPhotos(reports)
       .then(function (clean) {
         // Photos are URLs now - refresh the local cache so it stays small.
