@@ -4,6 +4,21 @@
 <script src="/sync.js"></script>
 
   <meta charset="utf-8">
+  <!-- Tells phones to use their real screen width instead of pretending to be
+       a ~980px desktop and shrinking everything to fit. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <style>
+    /* Narrow screens: keep the letter-width report sheet from forcing
+       sideways scrolling, and stop the loading wrapper from centring
+       content off-screen on tall phones. */
+    @media (max-width: 820px) {
+      html, body { overflow-x: hidden; }
+      body { display: block; align-items: initial; justify-content: initial; }
+      [style*="816px"], [style*="width: 816px"] { width: 100% !important; max-width: 100% !important; }
+      img { max-width: 100%; height: auto; }
+      input, select, textarea { font-size: 16px; } /* stops iOS auto-zoom on focus */
+    }
+  </style>
   <title>Bundled Page</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
