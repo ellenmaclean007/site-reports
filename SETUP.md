@@ -80,3 +80,4 @@ In your Downloads folder:
 - `index.html` — your original app, untouched
 
 Keep both until the migration above is confirmed working.
+
