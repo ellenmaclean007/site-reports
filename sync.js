@@ -1,103 +1,148 @@
 /* ------------------------------------------------------------------
-   Shared-storage layer for Site Reports.
+   Shared storage for Site Reports.
 
    Your app is untouched. It still reads and writes localStorage exactly
    as it always did. This file sits in front of localStorage and:
 
-     1. On load  - pulls the shared report from the server and puts it
-                   into localStorage BEFORE the app starts, so the app
-                   finds it right where it expects.
-     2. On save  - uploads any new photos to permanent storage, swaps the
-                   base64 blobs for URLs, and pushes the report up to the
-                   server so everyone else sees it.
+     1. On load  - pulls EVERY report from the server and assembles them
+                   into the shape your app expects (newest as the open
+                   report, the rest as history).
+     2. On save  - uploads new photos, then writes each report to the
+                   server individually, keyed by its own id.
 
-   Net effect: same app, but the data lives on the server instead of
-   inside one browser -- and the 5 MB ceiling is gone.
+   Because reports are stored separately rather than as one big blob,
+   two people working on different reports cannot overwrite each other,
+   and starting a new report can never displace an existing one.
+
+   Editing is gated by an edit key when EDIT_KEY is set on the server.
+   Unlock a device once by visiting:  <site>/?edit=YOUR_KEY
    ------------------------------------------------------------------ */
 (function () {
   'use strict';
 
   var KEY = 'lfg-site-report-v1';
+  var EDIT_KEY_STORE = 'lfg-edit-key';
   var SAVE_DEBOUNCE_MS = 1500;
 
   var origGet = localStorage.getItem.bind(localStorage);
   var origSet = localStorage.setItem.bind(localStorage);
 
-  // In-memory mirror. Used if localStorage refuses a write (quota) so the
-  // app keeps working instead of showing "too many photos".
   var memory = null;
-  var serverHadNothing = true;
 
   function cacheLocally(value) {
     memory = value;
     try { origSet(KEY, value); } catch (e) { /* quota - memory covers us */ }
   }
 
-  /* ---------- 1. Preload the shared report, synchronously ---------- */
-  // Deliberately synchronous: the app reads localStorage the instant it
-  // mounts, so the data has to already be there. One blocking request on
-  // first paint is a fair trade for not touching the app's code.
+  /* ---------- edit key ---------- */
+  // Visiting /?edit=SOMEKEY stores the key on this device and cleans the URL,
+  // so the key never lingers in the address bar or in browser history.
   try {
-    var xhr = new XMLHttpRequest();
-    xhr.open('GET', '/api/report', false);
-    xhr.send(null);
-    if (xhr.status === 200 && xhr.responseText && xhr.responseText !== 'null') {
-      cacheLocally(xhr.responseText);
-      serverHadNothing = false;
+    var qs = new URLSearchParams(location.search);
+    if (qs.has('edit')) {
+      localStorage.setItem(EDIT_KEY_STORE, qs.get('edit'));
+      qs.delete('edit');
+      history.replaceState({}, '', location.pathname + (qs.toString() ? '?' + qs : ''));
     }
-  } catch (e) {
-    // Offline or server down - fall through to whatever is already cached
-    // locally. The app stays usable in the field with no signal.
+  } catch (e) {}
+
+  function editHeaders(extra) {
+    var h = extra || {};
+    try {
+      var k = origGet(EDIT_KEY_STORE);
+      if (k) h['x-edit-key'] = k;
+    } catch (e) {}
+    return h;
   }
 
-  /* ---------- 2. Serve reads from cache ---------- */
+  /* ---------- report <-> app-state conversion ---------- */
+  var STATE_ONLY = ['history', 'zoom', 'viewOnly', 'filterDept', 'saved', 'screen',
+                    'logDept', 'logStatus', 'logView', 'openDept'];
+
+  function toReport(state) {
+    var r = {};
+    Object.keys(state).forEach(function (k) {
+      if (STATE_ONLY.indexOf(k) === -1) r[k] = state[k];
+    });
+    return r;
+  }
+
+  // Server gives us a flat list. The app wants one open report plus history.
+  function assemble(reports) {
+    if (!reports || !reports.length) return null;
+    var sorted = reports.slice().sort(function (a, b) {
+      return (b.updatedAt || 0) - (a.updatedAt || 0);
+    });
+    var current = sorted[0];
+    var state = {};
+    Object.keys(current).forEach(function (k) { state[k] = current[k]; });
+    state.history = sorted.slice(1);
+    return state;
+  }
+
+  /* ---------- 1. Preload every report, synchronously ---------- */
+  // Synchronous on purpose: the app reads localStorage the moment it mounts,
+  // so the data has to already be sitting there.
+  var serverHadNothing = true;
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/api/reports', false);
+    xhr.send(null);
+    if (xhr.status === 200) {
+      var list = JSON.parse(xhr.responseText || '[]');
+      var assembled = assemble(list);
+      if (assembled) {
+        cacheLocally(JSON.stringify(assembled));
+        serverHadNothing = false;
+      }
+    }
+  } catch (e) {
+    // Offline - fall back to whatever this device already has cached, so the
+    // app stays usable on a job site with no signal.
+  }
+
   localStorage.getItem = function (k) {
     if (k === KEY && memory !== null) return memory;
     return origGet(k);
   };
 
-  /* ---------- 3. Photo offloading ---------- */
+  /* ---------- 2. Photo offloading ---------- */
   var IMG_RE = /^data:image\/[a-zA-Z+]+;base64,/;
 
   function uploadPhoto(dataUrl) {
     return fetch('/api/upload', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: editHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ photo: dataUrl })
     })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (j) { return (j && j.url) || dataUrl; })
-      .catch(function () { return dataUrl; }); // keep base64 rather than lose the photo
+      .catch(function () { return dataUrl; }); // keep base64 rather than lose a photo
   }
 
-  // Walks the report and replaces every base64 photo with a hosted URL.
-  function offloadPhotos(report) {
+  function offloadPhotos(reports) {
     var jobs = [];
-
-    function walkLots(lots) {
-      (lots || []).forEach(function (lot) {
+    reports.forEach(function (rep) {
+      (rep.lots || []).forEach(function (lot) {
         (lot.issues || []).forEach(function (issue) {
           (issue.photos || []).forEach(function (photo, idx) {
             if (typeof photo === 'string' && IMG_RE.test(photo)) {
-              jobs.push(
-                uploadPhoto(photo).then(function (url) { issue.photos[idx] = url; })
-              );
+              jobs.push(uploadPhoto(photo).then(function (url) {
+                issue.photos[idx] = url;
+              }));
             }
           });
         });
       });
-    }
-
-    walkLots(report.lots);
-    (report.history || []).forEach(function (h) { walkLots(h.lots); });
-
-    return Promise.all(jobs).then(function () { return report; });
+    });
+    return Promise.all(jobs).then(function () { return reports; });
   }
 
-  /* ---------- 4. Intercept saves ---------- */
+  /* ---------- 3. Intercept saves ---------- */
   var timer = null;
   var latest = null;
   var inFlight = false;
+  var lastSent = {}; // id -> JSON string, so we only PUT what actually changed
 
   function pushToServer() {
     if (inFlight || latest === null) return;
@@ -105,23 +150,41 @@
     latest = null;
     inFlight = true;
 
-    var report;
-    try { report = JSON.parse(payload); }
+    var state;
+    try { state = JSON.parse(payload); }
     catch (e) { inFlight = false; return; }
 
-    offloadPhotos(report)
+    // Every report this device knows about: the open one plus its history.
+    var reports = [toReport(state)].concat(state.history || []);
+    reports = reports.filter(function (r) { return r && r.id; });
+
+    offloadPhotos(reports)
       .then(function (clean) {
-        var body = JSON.stringify(clean);
-        cacheLocally(body); // photos are URLs now - this fits comfortably
-        return fetch('/api/report', {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: body
+        // Photos are URLs now - refresh the local cache so it stays small.
+        var rebuilt = assemble(clean);
+        if (rebuilt) cacheLocally(JSON.stringify(rebuilt));
+
+        var changed = clean.filter(function (r) {
+          var s = JSON.stringify(r);
+          if (lastSent[r.id] === s) return false;
+          lastSent[r.id] = s;
+          return true;
         });
+
+        return Promise.all(changed.map(function (r) {
+          r.updatedAt = Date.now();
+          return fetch('/api/reports', {
+            method: 'PUT',
+            headers: editHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify(r)
+          });
+        }));
       })
-      .then(function (r) {
+      .then(function (results) {
+        var ok = results.every(function (r) { return r && r.ok; });
+        var denied = results.some(function (r) { return r && r.status === 401; });
         window.dispatchEvent(new CustomEvent('report-sync', {
-          detail: { ok: r && r.ok }
+          detail: { ok: ok, readOnly: denied }
         }));
       })
       .catch(function () {
@@ -129,22 +192,19 @@
       })
       .then(function () {
         inFlight = false;
-        if (latest !== null) pushToServer(); // coalesce edits made while saving
+        if (latest !== null) pushToServer();
       });
   }
 
   localStorage.setItem = function (k, v) {
     if (k !== KEY) return origSet(k, v);
-    cacheLocally(v);         // instant local save, never throws
+    cacheLocally(v);
     latest = v;
     clearTimeout(timer);
     timer = setTimeout(pushToServer, SAVE_DEBOUNCE_MS);
   };
 
-  /* ---------- 5. First-run migration ---------- */
-  // If the server has nothing yet but this browser already holds a report
-  // (your machine, first visit after deploy), push it up so the existing
-  // Rogers Branch work becomes the shared copy everyone sees.
+  /* ---------- 4. First-run migration ---------- */
   if (serverHadNothing) {
     var existing = origGet(KEY);
     if (existing) {
@@ -153,16 +213,4 @@
       setTimeout(pushToServer, 0);
     }
   }
-
-  // Don't lose the last keystroke if the tab closes mid-debounce.
-  window.addEventListener('beforeunload', function () {
-    if (latest !== null && navigator.sendBeacon) {
-      try {
-        navigator.sendBeacon(
-          '/api/report',
-          new Blob([latest], { type: 'application/json' })
-        );
-      } catch (e) {}
-    }
-  });
 })();

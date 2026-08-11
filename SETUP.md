@@ -43,15 +43,35 @@ finish uploading before closing the tab (36 of them, maybe a minute).
 Open the site in a private/incognito window. You should see the Rogers Branch
 report, not the Willow Bend placeholder.
 
-## Optional: lock down editing
+## Every report is stored separately
 
-Right now anyone with the link can edit. To make it read-only for everyone
-but you, add an environment variable in Vercel:
+Reports are saved individually in Blob storage, one file per report, keyed by
+the report's own id (`reports/<id>.json`). This matters:
 
-- Settings → Environment Variables → add `EDIT_KEY` with any value you pick
+- Starting a new report can never displace an existing one
+- Two people working on **different** reports cannot overwrite each other
+- Nothing lives in a single all-or-nothing blob any more
 
-Saves will then require that key. Tell me if you want this on and I'll wire
-the key into the app's UI so you can unlock editing on your own devices.
+The app still shows the most recently updated report as the open one, with
+the rest in history — same as it always did.
+
+## Locking down editing
+
+`EDIT_KEY` makes the site read-only for everyone except devices you unlock.
+Viewers notice no difference; they open the link and see every report.
+
+**Turn it on:** Vercel → project → Settings → Environment Variables → add
+`EDIT_KEY` with any phrase you like. Redeploy.
+
+**Unlock your own devices:** visit the site once with the key in the URL —
+
+    https://site-reports-lfg.vercel.app/?edit=YOUR_KEY
+
+The key is saved on that device and stripped from the address bar
+immediately, so it doesn't sit in your browser history. Do this on your
+laptop and your phone. Anyone without it can read but not save.
+
+If `EDIT_KEY` is not set, the site stays open to edits from anyone.
 
 ## Worth doing: put this in GitHub
 
@@ -80,4 +100,3 @@ In your Downloads folder:
 - `index.html` — your original app, untouched
 
 Keep both until the migration above is confirmed working.
-
