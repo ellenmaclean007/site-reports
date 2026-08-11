@@ -76,7 +76,10 @@
     var current = sorted[0];
     var state = {};
     Object.keys(current).forEach(function (k) { state[k] = current[k]; });
-    state.history = sorted.slice(1);
+    // history must hold EVERY report, including the open one. The app builds
+    // its Outstanding / Completed / All Reports lists from history alone, so
+    // anything left out of it is invisible in those views.
+    state.history = sorted;
     return state;
   }
 
@@ -257,6 +260,15 @@
     // Every report this device knows about: the open one plus its history.
     var reports = [toReport(state)].concat(state.history || []);
     reports = reports.filter(function (r) { return r && r.id; });
+
+    // The open report now also appears in history, so the same id shows up
+    // twice. Keep the first - that's the live one being edited.
+    var seenId = {};
+    reports = reports.filter(function (r) {
+      if (seenId[r.id]) return false;
+      seenId[r.id] = true;
+      return true;
+    });
 
     // Only finalized reports go to the shared server. A report you are still
     // writing stays on your own device until you press FINALIZE REPORT, so
