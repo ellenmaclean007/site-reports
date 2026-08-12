@@ -22,7 +22,7 @@
 
   var KEY = 'lfg-site-report-v1';
   var EDIT_KEY_STORE = 'lfg-edit-key';
-  var SAVE_DEBOUNCE_MS = 1500;
+  var SAVE_DEBOUNCE_MS = 800;
 
   var origGet = localStorage.getItem.bind(localStorage);
   var origSet = localStorage.setItem.bind(localStorage);
@@ -352,6 +352,55 @@
     clearTimeout(timer);
     timer = setTimeout(pushToServer, SAVE_DEBOUNCE_MS);
   };
+
+  /* ---------- Flush on leaving the page ----------
+     Without this, ticking a box and immediately switching tabs, locking the
+     phone or closing the window loses the change: the debounce timer never
+     fires. keepalive lets the request outlive the page, and unlike
+     sendBeacon it still carries the edit key header.
+
+     This path skips the merge re-read - there is no time for it - so it is
+     last-write-wins. That is a fair trade against losing the edit entirely,
+     and it only ever runs when someone is leaving. */
+  function flushNow() {
+    if (latest === null) return;
+    var state;
+    try { state = JSON.parse(latest); } catch (e) { return; }
+
+    var pending = [toReport(state)].concat(state.history || []);
+    var seen = {};
+    pending = pending.filter(function (r) {
+      if (!r || !r.id || seen[r.id]) return false;
+      seen[r.id] = true;
+      return r.published === true;
+    });
+
+    pending.forEach(function (r) {
+      if (lastSent[r.id] === fingerprint(r)) return;   // nothing new here
+      var body = JSON.stringify(r);
+      // keepalive caps the body at 64KB; a report carrying un-uploaded
+      // base64 photos blows past that, so leave those to the normal path.
+      if (body.length > 60000 || body.indexOf('data:image') !== -1) return;
+      lastSent[r.id] = fingerprint(r);
+      try {
+        fetch('/api/reports', {
+          method: 'PUT',
+          headers: editHeaders({ 'Content-Type': 'application/json' }),
+          body: body,
+          keepalive: true
+        });
+      } catch (e) {}
+    });
+    latest = null;
+  }
+
+  window.addEventListener('pagehide', flushNow);
+  window.addEventListener('beforeunload', flushNow);
+  // pagehide is unreliable on mobile Safari/Chrome; hiding the tab is the
+  // event that actually fires when someone locks their phone.
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'hidden') flushNow();
+  });
 
   /* ---------- 4. First-run migration ---------- */
   if (serverHadNothing) {
