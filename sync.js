@@ -79,7 +79,22 @@
     // history must hold EVERY report, including the open one. The app builds
     // its Outstanding / Completed / All Reports lists from history alone, so
     // anything left out of it is invisible in those views.
-    state.history = sorted;
+    //
+    // Ordered by community A-Z so reports for the same community sit together,
+    // then newest first within each community. The report left OPEN is still
+    // the most recently edited one - only the list order changes.
+    state.history = reports.slice().sort(function (a, b) {
+      var ca = (a.community || '').trim().toLowerCase();
+      var cb = (b.community || '').trim().toLowerCase();
+      if (ca !== cb) {
+        if (!ca) return 1;          // unnamed reports sink to the bottom
+        if (!cb) return -1;
+        return ca < cb ? -1 : 1;
+      }
+      var da = a.date || '', db = b.date || '';
+      if (da !== db) return da < db ? 1 : -1;   // newest date first
+      return (b.updatedAt || 0) - (a.updatedAt || 0);
+    });
     return state;
   }
 
